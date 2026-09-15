@@ -1,0 +1,1 @@
+import type { Request, Response } from "express"; import { gridAssetService } from "../services/GridAssetService"; export const gridAssetController = { list: (_req: Request, res: Response) => res.json(gridAssetService.list()), create: (req: Request, res: Response) => res.status(201).json(gridAssetService.create(req.body)) };

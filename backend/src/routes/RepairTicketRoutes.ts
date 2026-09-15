@@ -1,0 +1,1 @@
+import { Router } from "express"; import { repairTicketController } from "../controllers/RepairTicketController"; const router = Router(); router.get("/", repairTicketController.list); router.post("/", repairTicketController.create); export default router;

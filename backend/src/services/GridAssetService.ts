@@ -1,0 +1,1 @@
+import { gridAssetRepository } from "../repositories/GridAssetRepository"; export const gridAssetService = { list: () => gridAssetRepository.findAll(), create: (row: unknown) => gridAssetRepository.save(row) };

@@ -1,0 +1,1 @@
+import { sparePartUsageRepository } from "../repositories/SparePartUsageRepository"; export const sparePartUsageService = { list: () => sparePartUsageRepository.findAll(), create: (row: unknown) => sparePartUsageRepository.save(row) };
