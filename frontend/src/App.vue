@@ -1,26 +1,96 @@
-<script setup lang="ts">
-import { computed, ref } from "vue";
-import { routes } from "./router/routes";
-import { mockData } from "./mocks/seedData";
-import StatusBadge from "./components/common/StatusBadge.vue";
-import StatCard from "./components/common/StatCard.vue";
-const active = ref<string>(routes[0]?.route ?? "/dashboard");
-const current = computed(() => routes.find((route) => route.route === active.value) ?? routes[0]);
-const entries = Object.entries(mockData);
+<template>
+  <router-view v-if="isLoginPage" />
+  <el-container v-else class="layout">
+    <el-aside width="220px" class="aside">
+      <div class="brand">
+        <span class="brand-icon">⚡</span>
+        <div>
+          <div class="brand-name">配网抢修闭环</div>
+          <div class="brand-sub">grid-repair</div>
+        </div>
+      </div>
+      <el-menu :default-active="$route.path" router class="menu" background-color="#001529" text-color="#a6adb4"
+        active-text-color="#ffffff">
+        <el-menu-item v-for="item in menus" :key="item.path" :index="item.path">
+          <el-icon><component :is="item.icon" /></el-icon>
+          <span>{{ item.title }}</span>
+        </el-menu-item>
+      </el-menu>
+    </el-aside>
+    <el-container>
+      <el-header class="header">
+        <div class="crumb">{{ $route.meta.title || '' }}</div>
+        <div class="user-box">
+          <el-tag size="small" effect="dark" :type="roleTagType">{{ roleText }}</el-tag>
+          <span class="user-name">
+            {{ auth.user?.name }}
+            <span v-if="auth.user?.crewName" class="muted">（{{ auth.user.crewName }}）</span>
+          </span>
+          <el-button size="small" text type="danger" @click="onLogout">退出登录</el-button>
+        </div>
+      </el-header>
+      <el-main class="main">
+        <router-view />
+      </el-main>
+    </el-container>
+  </el-container>
+</template>
+
+<script setup>
+import { computed } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
+import { ElMessageBox } from 'element-plus';
+import {
+  Odometer, Warning, Tickets, Box, OfficeBuilding, Document,
+} from '@element-plus/icons-vue';
+import { useAuthStore } from './stores/auth';
+import { RoleText } from './constants';
+
+const route = useRoute();
+const router = useRouter();
+const auth = useAuthStore();
+
+const isLoginPage = computed(() => route.name === 'login');
+const roleText = computed(() => RoleText[auth.role] || auth.role);
+const roleTagType = computed(() => ({
+  dispatcher: 'primary', leader: 'success', keeper: 'warning', auditor: 'info',
+}[auth.role] || 'info'));
+
+const allMenus = [
+  { path: '/dashboard', title: '抢修态势', icon: Odometer },
+  { path: '/faults', title: '故障报修', icon: Warning },
+  { path: '/tickets', title: '抢修工单', icon: Tickets },
+  { path: '/parts', title: '备件库存', icon: Box },
+  { path: '/assets', title: '配网资产', icon: OfficeBuilding },
+  { path: '/audit', title: '审计日志', icon: Document, roles: ['auditor'] },
+];
+const menus = computed(() => allMenus.filter((m) => !m.roles || m.roles.includes(auth.role)));
+
+async function onLogout() {
+  try {
+    await ElMessageBox.confirm('确认退出登录？', '提示', { type: 'warning' });
+  } catch {
+    return; // 用户取消
+  }
+  await auth.logout();
+  router.push('/login');
+}
 </script>
 
-<template>
-  <div class="shell">
-    <aside>
-      <div class="brand">电力配网抢修工单系统</div>
-      <nav>
-        <button v-for="route in routes" :key="route.route" :class="{ active: active === route.route }" @click="active = route.route">{{ route.name }}</button>
-      </nav>
-    </aside>
-    <main class="page">
-      <section class="page-head"><div><p class="eyebrow">grid-repair</p><h1>{{ current?.name }}</h1></div><StatusBadge value="LOCAL_DATA" /></section>
-      <section class="metrics"><StatCard label="核心模型" :value="entries.length" /><StatCard label="共享枚举" :value="3" /><StatCard label="本地记录" :value="entries.reduce((s, [, rows]) => s + rows.length, 0)" /></section>
-      <section class="workbench"><div class="panel wide"><h2>业务数据</h2><article class="row" v-for="[key, rows] in entries" :key="key"><strong>{{ key }}</strong><span>{{ rows.length }} 条</span><StatusBadge value="READY" /></article></div><div class="panel"><h2>联动检查</h2><p>页面、store、API、构造器、日志模板和枚举常量均按提示词拆分。</p></div></section>
-    </main>
-  </div>
-</template>
+<style scoped>
+.layout { height: 100vh; }
+.aside { background: #001529; display: flex; flex-direction: column; }
+.brand { display: flex; align-items: center; gap: 10px; padding: 18px 16px; color: #fff; }
+.brand-icon { font-size: 26px; }
+.brand-name { font-weight: 700; font-size: 15px; }
+.brand-sub { font-size: 11px; color: #6b7684; }
+.menu { border-right: none; flex: 1; }
+.header {
+  background: #fff; display: flex; align-items: center; justify-content: space-between;
+  border-bottom: 1px solid #e4e7ed;
+}
+.crumb { font-weight: 600; color: #303133; }
+.user-box { display: flex; align-items: center; gap: 10px; }
+.user-name { font-size: 14px; color: #606266; }
+.main { padding: 20px; overflow-y: auto; }
+</style>

@@ -1,0 +1,382 @@
+'use strict';
+
+/**
+ * 端到端测试：以独立端口 + 临时数据库启动服务，跑通
+ * 登记合并 → 派工校验 → 班组推进 → 备件领用/释放 → 复电补派 → 关闭 全链路，
+ * 以及 RBAC、超量、重复占用等异常分支。
+ * 运行：node test/e2e.js
+ */
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+const PORT = 29904;
+const BASE = `http://localhost:${PORT}/api`;
+const DB_FILE = path.join(__dirname, '..', 'data', 'e2e-test.sqlite');
+
+let passed = 0;
+let failed = 0;
+const failures = [];
+
+function check(name, cond, extra) {
+  if (cond) {
+    passed++;
+    console.log(`  ✓ ${name}`);
+  } else {
+    failed++;
+    failures.push(name);
+    console.log(`  ✗ ${name}${extra !== undefined ? ' → ' + JSON.stringify(extra) : ''}`);
+  }
+}
+
+async function api(method, url, { token, body } = {}) {
+  const res = await fetch(BASE + url, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let data = null;
+  try { data = await res.json(); } catch { /* 空响应 */ }
+  return { status: res.status, data };
+}
+
+async function login(username) {
+  const { status, data } = await api('POST', '/auth/login', { body: { username, password: '123456' } });
+  if (status !== 200) throw new Error(`登录失败 ${username}: ${JSON.stringify(data)}`);
+  return data.token;
+}
+
+async function waitForServer(child, retries = 60) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(`http://localhost:${PORT}/health`);
+      if (res.ok) return;
+    } catch { /* 未就绪 */ }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  child.kill();
+  throw new Error('服务启动超时');
+}
+
+async function main() {
+  fs.rmSync(DB_FILE, { force: true });
+  const child = spawn(process.execPath, [path.join(__dirname, '..', 'src', 'main.js')], {
+    env: { ...process.env, PORT: String(PORT), GRID_REPAIR_DB_FILE: DB_FILE },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.stderr.on('data', (d) => process.stderr.write(`[server] ${d}`));
+
+  try {
+    await waitForServer(child);
+
+    const dispatcher = await login('dispatcher01');
+    const leader1 = await login('leader01'); // 抢修一班
+    const leader2 = await login('leader02'); // 抢修二班
+    const keeper = await login('keeper01');
+    const auditor = await login('auditor01');
+
+    // ---------- 认证与 RBAC ----------
+    console.log('\n[1] 认证与角色权限');
+    {
+      const r = await api('GET', '/tickets');
+      check('未登录访问返回 401', r.status === 401 && r.data.error.code === 'AUTH_REQUIRED');
+
+      const bad = await api('POST', '/auth/login', { body: { username: 'dispatcher01', password: 'wrong' } });
+      check('错误密码返回 401 INVALID_CREDENTIALS', bad.status === 401 && bad.data.error.code === 'INVALID_CREDENTIALS');
+
+      const r1 = await api('POST', '/faults', { token: leader1, body: {} });
+      check('班组长不能登记报修（403）', r1.status === 403 && r1.data.error.code === 'FORBIDDEN');
+
+      const r2 = await api('POST', '/tickets/3/dispatch', { token: keeper, body: { crew_id: 2 } });
+      check('仓管不能派工（403）', r2.status === 403);
+
+      const r3 = await api('POST', '/usages/1/approve', { token: dispatcher, body: {} });
+      check('调度员不能审批备件（403）', r3.status === 403);
+
+      const r4 = await api('GET', '/audit-logs', { token: dispatcher });
+      check('非审计员不能查审计日志（403）', r4.status === 403);
+
+      const r5 = await api('POST', '/faults', { token: auditor, body: {} });
+      check('审计员只读，不能登记（403）', r5.status === 403);
+    }
+
+    // ---------- 登记与合并 ----------
+    console.log('\n[2] 故障登记与合并');
+    let ticketA;
+    let ticketD;
+    {
+      // 新线路+类型 → 生成新工单
+      const r = await api('POST', '/faults', {
+        token: dispatcher,
+        body: { reporter_name: '测试甲', phone: '13000000001', asset_id: 6, fault_type: 'TRIP', severity: 'MINOR', address_desc: '城南一线跳闸', report_channel: '热线' },
+      });
+      check('登记新故障生成工单', r.status === 201 && r.data.merged === false && r.data.ticket.status === 'WAIT_DISPATCH', r.data);
+      check('新工单等级=报修等级', r.data.ticket.priority === 'MINOR');
+      ticketA = r.data.ticket;
+
+      // 同线路同类型未闭环 → 合并，且等级提升
+      const r2 = await api('POST', '/faults', {
+        token: dispatcher,
+        body: { reporter_name: '测试乙', phone: '13000000002', asset_id: 7, fault_type: 'TRIP', severity: 'CRITICAL', address_desc: '城南大道环网柜跳闸', report_channel: '微信' },
+      });
+      check('同线路同类型合并进未闭环工单', r2.status === 201 && r2.data.merged === true && r2.data.ticket.id === ticketA.id, r2.data);
+      check('合并后工单等级提升为最高', r2.data.ticket.priority === 'CRITICAL');
+
+      // 再报一条低等级，等级不降
+      const r3 = await api('POST', '/faults', {
+        token: dispatcher,
+        body: { reporter_name: '测试丙', phone: '13000000003', asset_id: 6, fault_type: 'TRIP', severity: 'MINOR', address_desc: '农贸市场又跳了', report_channel: '热线' },
+      });
+      check('低等级报修合并后不降低工单等级', r3.data.ticket.priority === 'CRITICAL');
+
+      const detail = await api('GET', `/tickets/${ticketA.id}`, { token: dispatcher });
+      check('工单关联 3 条报修记录', detail.data.reports.length === 3, detail.data.reports.length);
+
+      // 不同故障类型不合并
+      const r4 = await api('POST', '/faults', {
+        token: dispatcher,
+        body: { reporter_name: '测试丁', phone: '13000000004', asset_id: 6, fault_type: 'SAFETY_RISK', severity: 'MAJOR', address_desc: '变压器异响', report_channel: '热线' },
+      });
+      check('同线路不同类型生成独立工单', r4.data.merged === false && r4.data.ticket.id !== ticketA.id);
+      ticketD = r4.data.ticket.id;
+
+      const badReq = await api('POST', '/faults', { token: dispatcher, body: { reporter_name: '', phone: '', asset_id: 999 } });
+      check('非法报修参数返回 400', badReq.status === 400 && badReq.data.error.code === 'VALIDATION_ERROR');
+    }
+
+    // ---------- 派工校验 ----------
+    console.log('\n[3] 派工规则（技能/值班/在途）');
+    {
+      // 种子数据：WO-0003 CRITICAL EQUIPMENT_DAMAGE 待派工
+      const offDuty = await api('POST', '/tickets/3/dispatch', { token: dispatcher, body: { crew_id: 4 } });
+      check('非值班班组不可派（CREW_OFF_DUTY）', offDuty.status === 409 && offDuty.data.error.code === 'CREW_OFF_DUTY', offDuty.data);
+
+      const mismatch = await api('POST', '/tickets/3/dispatch', { token: dispatcher, body: { crew_id: 1 } });
+      check('技能不匹配不可派（CREW_SKILL_MISMATCH）', mismatch.status === 409 && mismatch.data.error.code === 'CREW_SKILL_MISMATCH');
+
+      const busy = await api('POST', '/tickets/3/dispatch', { token: dispatcher, body: { crew_id: 1 } });
+      check('一班有在途任务且技能不符，优先报技能或不匹配', busy.status === 409);
+
+      // 一班技能不符，改用 WO-0002 所属类型验证在途：先给一班造一个匹配的在途单
+      // WO-0002 是一班的 OUTAGE 在途单；新登记的城南一线 TRIP 单（ticketA）一班技能匹配
+      const busy2 = await api('POST', `/tickets/${ticketA.id}/dispatch`, { token: dispatcher, body: { crew_id: 1 } });
+      check('有在途任务的班组不可重复占用（CREW_BUSY）', busy2.status === 409 && busy2.data.error.code === 'CREW_BUSY', busy2.data);
+
+      const ok = await api('POST', '/tickets/3/dispatch', { token: dispatcher, body: { crew_id: 2 } });
+      check('派工成功（二班技能匹配且空闲）', ok.status === 200 && ok.data.status === 'ASSIGNED' && ok.data.crew_id === 2, ok.data);
+
+      const again = await api('POST', '/tickets/3/dispatch', { token: dispatcher, body: { crew_id: 3 } });
+      check('已派工工单不能重复派（TICKET_NOT_WAITING）', again.status === 409 && again.data.error.code === 'TICKET_NOT_WAITING');
+
+      const avail = await api('GET', '/crews/available?fault_type=EQUIPMENT_DAMAGE', { token: dispatcher });
+      const c2 = avail.data.find((c) => c.id === 2);
+      const c4 = avail.data.find((c) => c.id === 4);
+      check('可派性接口标注在途班组不可派', c2 && c2.eligible === false && /在途/.test(c2.reason), c2);
+      check('可派性接口标注非值班班组不可派', c4 && c4.eligible === false && /值班/.test(c4.reason), c4);
+    }
+
+    // ---------- 班组推进与备件 ----------
+    console.log('\n[4] 班组推进 + 备件领用');
+    {
+      const wrongLeader = await api('POST', '/tickets/3/advance', { token: leader1, body: { action: 'arrive' } });
+      check('非本班组班组长不能推进（403）', wrongLeader.status === 403, wrongLeader.data);
+
+      const wrongOrder = await api('POST', '/tickets/3/advance', { token: leader2, body: { action: 'restore' } });
+      check('不能跳状态推进（TICKET_BAD_STATE）', wrongOrder.status === 409 && wrongOrder.data.error.code === 'TICKET_BAD_STATE');
+
+      const arrive = await api('POST', '/tickets/3/advance', { token: leader2, body: { action: 'arrive' } });
+      check('到场推进成功', arrive.status === 200 && arrive.data.ticket.status === 'ARRIVED');
+      const repair = await api('POST', '/tickets/3/advance', { token: leader2, body: { action: 'start_repair' } });
+      check('开始处理推进成功', repair.status === 200 && repair.data.ticket.status === 'REPAIRING');
+
+      // 备件：熔断器（id=6）可用库存 0 → 超量拦截
+      const over = await api('POST', '/tickets/3/parts', { token: leader2, body: { part_id: 6, quantity: 1 } });
+      check('零库存备件申请被拦截（STOCK_INSUFFICIENT）', over.status === 409 && over.data.error.code === 'STOCK_INSUFFICIENT', over.data);
+
+      // 柱上开关（id=3）可用 3，申请 5 → 超量
+      const over2 = await api('POST', '/tickets/3/parts', { token: leader2, body: { part_id: 3, quantity: 5 } });
+      check('申请量超可用库存被拦截', over2.status === 409 && over2.data.error.code === 'STOCK_INSUFFICIENT');
+
+      const req1 = await api('POST', '/tickets/3/parts', { token: leader2, body: { part_id: 3, quantity: 2 } });
+      check('备件申请成功（待审批）', req1.status === 201 && req1.data.status === 'REQUESTED', req1.data);
+      const usage1 = req1.data.id;
+
+      const req2 = await api('POST', '/tickets/3/parts', { token: leader2, body: { part_id: 5, quantity: 4 } });
+      const usage2 = req2.data.id;
+
+      // 审批前库存不变
+      const before = await api('GET', '/parts', { token: keeper });
+      check('待审批不占用库存', before.data.find((p) => p.id === 3).available_qty === 3);
+
+      const rej = await api('POST', `/usages/${usage2}/reject`, { token: keeper, body: { reason: '规格不符' } });
+      check('仓管驳回申请', rej.status === 200 && rej.data.status === 'REJECTED');
+
+      const app = await api('POST', `/usages/${usage1}/approve`, { token: keeper, body: {} });
+      check('仓管审批出库', app.status === 200 && app.data.status === 'APPROVED');
+      const after = await api('GET', '/parts', { token: keeper });
+      check('审批后库存同步扣减（3→1）', after.data.find((p) => p.id === 3).available_qty === 1);
+
+      const dupApprove = await api('POST', `/usages/${usage1}/approve`, { token: keeper, body: {} });
+      check('重复审批被拒绝（409）', dupApprove.status === 409);
+    }
+
+    // ---------- 改派释放 ----------
+    console.log('\n[5] 改派同步释放库存与班组占用');
+    {
+      const re = await api('POST', '/tickets/3/reassign', { token: dispatcher, body: { crew_id: 3 } });
+      check('改派到三班成功', re.status === 200 && re.data.crew_id === 3 && re.data.status === 'ASSIGNED', re.data);
+
+      const parts = await api('GET', '/parts', { token: keeper });
+      check('改派后已领备件库存回补（1→3）', parts.data.find((p) => p.id === 3).available_qty === 3);
+
+      const detail = await api('GET', '/tickets/3', { token: dispatcher });
+      const released = detail.data.usages.find((u) => u.status === 'RELEASED');
+      check('原领用单状态变为已释放', !!released, detail.data.usages);
+
+      const logs = await api('GET', '/stock-logs?part_id=3', { token: keeper });
+      check('库存流水记录释放入库', logs.data.some((l) => l.change_qty === 2 && /释放/.test(l.reason)), logs.data);
+
+      // 撤回到待派工
+      const back = await api('POST', '/tickets/3/reassign', { token: dispatcher, body: {} });
+      check('撤回工单回待派工队列', back.status === 200 && back.data.status === 'WAIT_DISPATCH' && back.data.crew_id === null);
+    }
+
+    // ---------- 复电补派 ----------
+    console.log('\n[6] 复电后按等级与等待时长补派');
+    {
+      // 当前待派工：WO-0003(CRITICAL,最早)、ticketA(CRITICAL)、ticketD(MAJOR)、WO-0004(MINOR)
+      // 空闲值班班组：一班(OUTAGE/TRIP)、二班(EQUIPMENT_DAMAGE/SAFETY_RISK)、三班(全能)
+      // 一班复电后补派：一班→ticketA(TRIP)，二班→WO-0003，三班→ticketD(MAJOR 优先于 WO-0004 MINOR)
+      const restore = await api('POST', '/tickets/2/advance', { token: leader1, body: { action: 'restore' } });
+      check('一班复电成功', restore.status === 200 && restore.data.ticket.status === 'RESTORED', restore.data);
+      check('复电触发补派', Array.isArray(restore.data.backfilled) && restore.data.backfilled.length >= 1, restore.data.backfilled);
+
+      const tA = await api('GET', `/tickets/${ticketA.id}`, { token: dispatcher });
+      check('同类型排队工单被自动补派给一班', tA.data.ticket.status === 'ASSIGNED' && tA.data.ticket.crew_id === 1, tA.data.ticket);
+
+      const t3 = await api('GET', '/tickets/3', { token: dispatcher });
+      check('最高等级 WO-0003 被补派（AUTO_BACKFILL）',
+        t3.data.ticket.status === 'ASSIGNED' && t3.data.ticket.dispatch_mode === 'AUTO_BACKFILL', t3.data.ticket);
+
+      const tD = await api('GET', `/tickets/${ticketD}`, { token: dispatcher });
+      check('次高等级 ticketD 补派给三班', tD.data.ticket.status === 'ASSIGNED' && tD.data.ticket.crew_id === 3, tD.data.ticket);
+
+      const t4 = await api('GET', '/tickets/4', { token: dispatcher });
+      check('最低等级 WO-0004 因匹配班组均已占用而继续排队', t4.data.ticket.status === 'WAIT_DISPATCH', t4.data.ticket);
+
+      // 一班已有在途（ticketA），不能再被占用
+      const crews = await api('GET', '/crews', { token: dispatcher });
+      const c1 = crews.data.find((c) => c.id === 1);
+      check('一班被新工单占用，不重复派单', c1.active_ticket && c1.active_ticket.id === ticketA.id, c1);
+    }
+
+    // ---------- 退回 / 核销 / 关闭 ----------
+    console.log('\n[7] 备件退回核销与工单关闭');
+    {
+      // ticketA 现为一班在途（ASSIGNED）。一班推进至处理中
+      await api('POST', `/tickets/${ticketA.id}/advance`, { token: leader1, body: { action: 'arrive' } });
+      await api('POST', `/tickets/${ticketA.id}/advance`, { token: leader1, body: { action: 'start_repair' } });
+
+      // 在处理中领用两笔备件并审批出库
+      const reqA = await api('POST', `/tickets/${ticketA.id}/parts`, { token: leader1, body: { part_id: 1, quantity: 3 } });
+      const usageA = reqA.data.id;
+      await api('POST', `/usages/${usageA}/approve`, { token: keeper, body: {} });
+      const reqB = await api('POST', `/tickets/${ticketA.id}/parts`, { token: leader1, body: { part_id: 1, quantity: 2 } });
+      const usageB = reqB.data.id;
+      await api('POST', `/usages/${usageB}/approve`, { token: keeper, body: {} });
+      const p1 = await api('GET', '/parts', { token: keeper });
+      check('两笔领用后避雷器库存 10→5', p1.data.find((p) => p.id === 1).available_qty === 5, p1.data.find((p) => p.id === 1));
+
+      // 复电后工单释放班组，备件申请通道关闭
+      await api('POST', `/tickets/${ticketA.id}/advance`, { token: leader1, body: { action: 'restore' } });
+      const lateReq = await api('POST', `/tickets/${ticketA.id}/parts`, { token: leader1, body: { part_id: 1, quantity: 1 } });
+      check('复电后不可再申请备件（409）', lateReq.status === 409 && lateReq.data.error.code === 'TICKET_BAD_STATE');
+
+      // 关闭被未完结领用阻塞
+      const blocked = await api('POST', `/tickets/${ticketA.id}/advance`, { token: leader1, body: { action: 'close' } });
+      check('存在未完结领用时禁止关闭', blocked.status === 409 && blocked.data.error.code === 'TICKET_BAD_STATE', blocked.data);
+
+      // 退回第一笔 → 库存回补
+      const ret = await api('POST', `/usages/${usageA}/return`, { token: leader1, body: {} });
+      check('班组长退回备件', ret.status === 200 && ret.data.status === 'RETURNED');
+      const p1b = await api('GET', '/parts', { token: keeper });
+      check('退回后库存回补 5→8', p1b.data.find((p) => p.id === 1).available_qty === 8);
+
+      // 核销第二笔（消耗不退库存）
+      const con = await api('POST', `/usages/${usageB}/consume`, { token: leader1, body: {} });
+      check('核销消耗成功', con.status === 200 && con.data.status === 'CONSUMED', con.data);
+      const p1c = await api('GET', '/parts', { token: keeper });
+      check('核销不回补库存（仍为 8）', p1c.data.find((p) => p.id === 1).available_qty === 8);
+
+      const closed = await api('POST', `/tickets/${ticketA.id}/advance`, { token: leader1, body: { action: 'close' } });
+      check('工单关闭成功', closed.status === 200 && closed.data.ticket.status === 'CLOSED');
+
+      const detail = await api('GET', `/tickets/${ticketA.id}`, { token: dispatcher });
+      check('关闭后关联报修单全部闭环', detail.data.reports.every((r) => r.status === 'CLOSED'));
+
+      // 关闭后同线路同类型新报修应生成新工单而非合并进已关闭工单
+      const rNew = await api('POST', '/faults', {
+        token: dispatcher,
+        body: { reporter_name: '测试戊', phone: '13000000005', asset_id: 6, fault_type: 'TRIP', severity: 'MAJOR', address_desc: '城南一线再次跳闸', report_channel: '热线' },
+      });
+      check('已闭环工单不再吸收合并', rNew.data.merged === false && rNew.data.ticket.id !== ticketA.id, rNew.data);
+    }
+
+    // ---------- 审计与库存流水 ----------
+    console.log('\n[8] 审计追溯');
+    {
+      const logs = await api('GET', '/audit-logs?page=1&pageSize=100', { token: auditor });
+      check('审计员可查询日志', logs.status === 200 && logs.data.total > 0);
+      const actions = new Set(logs.data.rows.map((r) => r.action));
+      check('关键动作均有审计记录',
+        ['FAULT_REGISTERED', 'FAULT_MERGED', 'TICKET_CREATED', 'TICKET_DISPATCHED', 'TICKET_AUTO_DISPATCHED',
+         'TICKET_ADVANCED', 'PART_APPROVED', 'PART_RETURNED', 'TICKET_REASSIGNED', 'TICKET_CLOSED']
+          .every((a) => actions.has(a)), [...actions]);
+
+      const ticketLogs = await api('GET', `/audit-logs?entityType=TICKET&entityId=${ticketA.id}`, { token: auditor });
+      check('可按工单追溯全部变更', ticketLogs.data.rows.length >= 5, ticketLogs.data.rows.length);
+
+      const stock = await api('GET', '/stock-logs?part_id=1', { token: auditor });
+      check('库存流水含出库与退回入库', stock.data.some((l) => l.change_qty < 0) && stock.data.some((l) => l.change_qty > 0));
+    }
+
+    // ---------- 持久化：重启后状态一致 ----------
+    console.log('\n[9] 落盘持久化（模拟刷新/重启）');
+    {
+      check('数据库文件已落盘', fs.existsSync(DB_FILE));
+      const before = await api('GET', '/tickets', { token: dispatcher });
+      child.kill('SIGTERM');
+      await new Promise((r) => setTimeout(r, 400));
+      const child2 = spawn(process.execPath, [path.join(__dirname, '..', 'src', 'main.js')], {
+        env: { ...process.env, PORT: String(PORT), GRID_REPAIR_DB_FILE: DB_FILE },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      child2.stderr.on('data', (d) => process.stderr.write(`[server2] ${d}`));
+      await waitForServer(child2);
+      const token2 = await login('dispatcher01');
+      const after = await api('GET', '/tickets', { token: token2 });
+      check('重启后工单状态与重启前一致',
+        JSON.stringify(before.data.map((t) => [t.id, t.status, t.crew_id])) ===
+        JSON.stringify(after.data.map((t) => [t.id, t.status, t.crew_id])));
+      const partsAfter = await api('GET', '/parts', { token: token2 });
+      check('重启后库存一致（避雷器可用 8）', partsAfter.data.find((p) => p.id === 1).available_qty === 8);
+      child2.kill('SIGTERM');
+    }
+  } finally {
+    child.kill('SIGTERM');
+  }
+
+  console.log(`\n结果: ${passed} 通过, ${failed} 失败`);
+  if (failed) {
+    console.log('失败项:', failures.join(' | '));
+    process.exit(1);
+  }
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

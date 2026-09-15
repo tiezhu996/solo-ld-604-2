@@ -1,1 +1,0 @@
-import { Router } from "express"; import { sparePartUsageController } from "../controllers/SparePartUsageController"; const router = Router(); router.get("/", sparePartUsageController.list); router.post("/", sparePartUsageController.create); export default router;

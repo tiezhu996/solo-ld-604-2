@@ -1,1 +1,0 @@
-export const createGridAssetDto = (overrides = {}) => ({ id: 1, asset_code: "asset code 1", asset_type: "VOLTAGE_LOW", feeder_line: "feeder line 1", voltage_level: "LOW", location_desc: "location desc 1", health_status: "ASSIGNED", owner_team_id: 1, ...overrides });

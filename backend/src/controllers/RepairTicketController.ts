@@ -1,1 +1,0 @@
-import type { Request, Response } from "express"; import { repairTicketService } from "../services/RepairTicketService"; export const repairTicketController = { list: (_req: Request, res: Response) => res.json(repairTicketService.list()), create: (req: Request, res: Response) => res.status(201).json(repairTicketService.create(req.body)) };

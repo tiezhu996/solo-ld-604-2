@@ -1,1 +1,0 @@
-import { repairTicketRepository } from "../repositories/RepairTicketRepository"; export const repairTicketService = { list: () => repairTicketRepository.findAll(), create: (row: unknown) => repairTicketRepository.save(row) };
