@@ -64,7 +64,7 @@ async function waitForServer(child, retries = 60) {
 async function main() {
   fs.rmSync(DB_FILE, { force: true });
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'src', 'main.js')], {
-    env: { ...process.env, PORT: String(PORT), GRID_REPAIR_DB_FILE: DB_FILE },
+    env: { ...process.env, PORT: String(PORT), GRID_REPAIR_DB_FILE: DB_FILE, GRID_REPAIR_SKIP_FRONTEND_BUILD: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   child.stderr.on('data', (d) => process.stderr.write(`[server] ${d}`));
@@ -512,7 +512,7 @@ async function main() {
       child.kill('SIGTERM');
       await new Promise((r) => setTimeout(r, 400));
       const child2 = spawn(process.execPath, [path.join(__dirname, '..', 'src', 'main.js')], {
-        env: { ...process.env, PORT: String(PORT), GRID_REPAIR_DB_FILE: DB_FILE },
+        env: { ...process.env, PORT: String(PORT), GRID_REPAIR_DB_FILE: DB_FILE, GRID_REPAIR_SKIP_FRONTEND_BUILD: '1' },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       child2.stderr.on('data', (d) => process.stderr.write(`[server2] ${d}`));

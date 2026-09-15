@@ -14,20 +14,17 @@
 cd backend && npm install && npm start
 ```
 
-- 后端 + 前端（已构建的静态资源由后端托管）：<http://localhost:21104>
+- 页面与接口同一入口：<http://localhost:21104>（页面 `/`，接口 `/api`）
 - 健康检查：<http://localhost:21104/health>
-- 首次启动自动建库并写入种子数据（`backend/data/grid-repair.sqlite`）
-
-前端改动后重新构建即可，无需重启后端：
-
-```bash
-cd frontend && npm install && npm run build
-```
+- **前端产物自动补齐**：`frontend/dist` 缺失或已落后于前端源码时，启动过程自动安装依赖并
+  重新构建；补齐失败会打印构建日志并以非零码终止，不会留下"只有健康检查"的半截服务
+- 首次启动自动建库并写入种子数据（`backend/data/grid-repair.sqlite`）；
+  **重复启动不影响已有数据**（仅空库时播种）
 
 前端联调开发（Vite 热更新，代理 `/api` 到 21104）：
 
 ```bash
-cd frontend && npm run dev   # http://localhost:20104
+cd frontend && npm install && npm run dev   # http://localhost:20104
 ```
 
 ### Docker Compose
@@ -150,17 +147,15 @@ cd backend
 npm test          # 105 项端到端测试：独立端口 + 临时库，覆盖全闭环与异常分支
 
 cd ..
-node test/startup-regression.js   # 48 项启动链路回归：模拟全新检出的安装/构建/启动
+node test/startup-regression.js   # 36 项启动链路回归：模拟全新检出的一条命令启动
 ```
 
 **启动链路回归**（`test/startup-regression.js`，仅测试资产，不改业务实现）：
 在临时目录复制项目副本（无 `node_modules` / `frontend/dist` / 运行数据），按本 README
-的本地运行步骤真实执行 `npm install` → `npm run build` → `npm start`，随后通过统一入口
-（`http://localhost:29511`）验证关键页面（`/`、SPA 回退、JS/CSS 资源）与关键接口
-（登录、态势、工单、班组、备件、报修、资产、审计）；再覆盖三种状态——
-无构建产物时 `/health` 正常但页面 404（**健康检查不代表整站可用**）、
-旧构建产物随真实重新构建而更新、真实构建失败时退出码非零且错误输出清楚。
-测试自备临时目录并在结束后清理，可连续重复运行（已验证三次结果一致）。
+首选步骤真实执行 `npm install && npm start`，验证启动时自动补齐前端产物、
+统一入口下页面与接口同时可用；再覆盖——前端补齐失败时进程终止且错误清晰
+（不会只留健康检查）、旧构建产物落后于源码时自动重建（旧资源不掩盖当前源码）、
+重复启动不破坏已有数据。测试自备临时目录并在结束后清理，可连续重复运行。
 
 **后端端到端**覆盖：认证与四角色 RBAC、登记合并与等级提升、已复电/已闭环工单不吸收新报修、
 派工三类校验、状态机越级拦截、超量领用拦截、审批/驳回/退回/核销的库存联动、
@@ -177,4 +172,6 @@ node test/startup-regression.js   # 48 项启动链路回归：模拟全新检�
 |---|---|---|
 | `PORT` | `21104` | 后端监听端口 |
 | `GRID_REPAIR_DB_FILE` | `backend/data/grid-repair.sqlite` | SQLite 数据文件路径 |
+| `GRID_REPAIR_FRONTEND_DIR` | `../frontend`（相对 backend/src） | 前端源码目录；目录不存在时跳过静态托管仅提供接口 |
+| `GRID_REPAIR_SKIP_FRONTEND_BUILD` | 空 | 置 `1` 时启动不自动补齐前端产物（测试用） |
 | `FRONTEND_PORT` / `BACKEND_PORT` | `20104` / `21104` | Compose 端口映射 |

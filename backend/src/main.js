@@ -7,6 +7,7 @@ const cors = require('cors');
 
 const { initDb } = require('./db');
 const { seedIfEmpty } = require('./seed');
+const { ensureFrontendAssets, resolveFrontendDir } = require('./frontendAssets');
 const apiRoutes = require('./routes');
 const { rateLimit } = require('./middleware/rateLimit');
 const { errorHandler, requestLogger } = require('./middleware/errorHandler');
@@ -14,6 +15,9 @@ const { errorHandler, requestLogger } = require('./middleware/errorHandler');
 const PORT = Number(process.env.PORT || 21104);
 
 async function main() {
+  // 启动前置：前端产物缺失/过期时自动补齐，补齐失败直接终止（exit 1）
+  ensureFrontendAssets();
+
   await initDb();
   if (seedIfEmpty()) console.log('空库 detected，已写入种子数据');
 
@@ -27,7 +31,7 @@ async function main() {
   app.use('/api', apiRoutes);
 
   // 托管前端构建产物（存在时），非 /api 路径回退到 index.html
-  const distDir = path.join(__dirname, '..', '..', 'frontend', 'dist');
+  const distDir = path.join(resolveFrontendDir(), 'dist');
   if (fs.existsSync(distDir)) {
     app.use(express.static(distDir));
     app.get(/^\/(?!api\/).*/, (_req, res) => res.sendFile(path.join(distDir, 'index.html')));
