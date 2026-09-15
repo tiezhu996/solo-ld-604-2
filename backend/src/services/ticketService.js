@@ -3,7 +3,8 @@
 const { tx, get, all, run, now } = require('../db');
 const { ApiError } = require('../errors');
 const {
-  ACTIVE_TICKET_STATUS, SeverityRank, SeverityText, TicketStatusText, UsageStatusText,
+  ACTIVE_TICKET_STATUS, ACTIVE_TICKET_STATUS_SQL, OPEN_REPORT_STATUS_SQL, OPEN_USAGE_STATUS_SQL,
+  SeverityRank, SeverityText, TicketStatusText, UsageStatusText,
   LogTemplates, renderTemplate,
 } = require('../constants');
 const audit = require('./auditService');
@@ -11,7 +12,7 @@ const audit = require('./auditService');
 /** 班组当前的在途工单（复电前占用班组） */
 function activeTicketOfCrew(crewId) {
   return get(
-    `SELECT * FROM repair_tickets WHERE crew_id = ? AND status IN ('ASSIGNED','ARRIVED','REPAIRING') LIMIT 1`,
+    `SELECT * FROM repair_tickets WHERE crew_id = ? AND status IN (${ACTIVE_TICKET_STATUS_SQL}) LIMIT 1`,
     [crewId]
   );
 }
@@ -78,7 +79,7 @@ function backfillQueuedTickets(actor) {
        WHERE c.duty_status = 'ON'
          AND NOT EXISTS (
            SELECT 1 FROM repair_tickets t
-           WHERE t.crew_id = c.id AND t.status IN ('ASSIGNED','ARRIVED','REPAIRING')
+           WHERE t.crew_id = c.id AND t.status IN (${ACTIVE_TICKET_STATUS_SQL})
          )
        ORDER BY c.id`
     );
@@ -132,7 +133,7 @@ function advance(actor, ticketId, action) {
     }
     if (action === 'close') {
       const openUsage = get(
-        `SELECT COUNT(*) AS c FROM part_usages WHERE ticket_id = ? AND status IN ('REQUESTED','APPROVED')`,
+        `SELECT COUNT(*) AS c FROM part_usages WHERE ticket_id = ? AND status IN (${OPEN_USAGE_STATUS_SQL})`,
         [ticket.id]
       );
       if (openUsage.c > 0) {
@@ -155,7 +156,7 @@ function advance(actor, ticketId, action) {
       backfilled = backfillQueuedTickets(actor);
     }
     if (action === 'close') {
-      run(`UPDATE fault_reports SET status = 'CLOSED' WHERE ticket_id = ? AND status != 'CLOSED'`, [ticket.id]);
+      run(`UPDATE fault_reports SET status = 'CLOSED' WHERE ticket_id = ? AND status IN (${OPEN_REPORT_STATUS_SQL})`, [ticket.id]);
       audit.write(actor, 'TICKET_CLOSED', 'TICKET', ticket.id,
         renderTemplate(LogTemplates.TICKET_CLOSED, { ticketNo: ticket.ticket_no }));
     }
@@ -167,18 +168,30 @@ function advance(actor, ticketId, action) {
  * 改派/撤回：释放原班组占用，并将该工单上未完结的备件申请同步释放——
  * 已审批的回库、待审批的作废，每条释放都写入含原申请人、数量、前后状态、
  * 关联工单的可追溯事件。目标班组校验、释放、改派在同一事务内完成，
- * 任一步失败整体回滚；已释放的申请不会被重复释放、重复记录。
+ * 任一步失败整体回滚。
+ * 幂等重试：相同工单请求同一目标班组、或再次撤回，直接返回当前状态，
+ * 零写入——不重复回库、不重复写流水、不重复记事件；并发相同请求亦然。
  */
 function reassign(actor, ticketId, newCrewId) {
   return tx(() => {
     const ticket = getTicketOrThrow(ticketId);
+    const targetCrewId = newCrewId ? Number(newCrewId) : null;
+
+    // —— 幂等重试：目标状态已经达成，返回当前成功状态，不产生任何副作用
+    if (targetCrewId && ticket.crew_id === targetCrewId) {
+      return { ...ticket, idempotent: true };
+    }
+    if (!targetCrewId && ticket.crew_id === null && ticket.status === 'WAIT_DISPATCH') {
+      return { ...ticket, idempotent: true };
+    }
+
     if (!ACTIVE_TICKET_STATUS.includes(ticket.status)) {
       throw new ApiError('TICKET_BAD_STATE', '仅在途工单可以改派');
     }
     // 先校验目标班组：校验失败时不产生任何写入（等效于整体回滚）
     let targetCrew = null;
-    if (newCrewId) {
-      targetCrew = assertCrewAssignable(newCrewId, ticket.fault_type);
+    if (targetCrewId) {
+      targetCrew = assertCrewAssignable(targetCrewId, ticket.fault_type);
     }
     const fromCrew = get('SELECT * FROM crews WHERE id = ?', [ticket.crew_id]);
 
@@ -189,7 +202,7 @@ function reassign(actor, ticketId, newCrewId) {
        FROM part_usages pu
        JOIN spare_parts sp ON sp.id = pu.part_id
        LEFT JOIN users ru ON ru.id = pu.requested_by
-       WHERE pu.ticket_id = ? AND pu.status IN ('APPROVED','REQUESTED')
+       WHERE pu.ticket_id = ? AND pu.status IN (${OPEN_USAGE_STATUS_SQL})
        ORDER BY pu.id`,
       [ticket.id]
     );

@@ -4,6 +4,7 @@ const { tx, get, all, run, now } = require('../db');
 const { ApiError } = require('../errors');
 const {
   SeverityRank, SeverityText, FaultTypeText, LogTemplates, renderTemplate,
+  ABSORBING_TICKET_STATUS_SQL,
 } = require('../constants');
 const audit = require('./auditService');
 
@@ -27,11 +28,12 @@ function registerFault(actor, payload) {
     if (!FaultTypeText[fault_type]) throw new ApiError('VALIDATION_ERROR', '故障类型不合法');
 
     // 同线路 + 同类型 + 仍可吸收（待派工/在途）的工单即合并目标；
-    // 已复电、已关闭工单不再吸收，新报修生成独立待派工单
+    // 已复电、已关闭工单不再吸收，新报修生成独立待派工单。
+    // 状态集统一引用共享常量，不在查询里另写字面量。
     const openTicket = get(
       `SELECT * FROM repair_tickets
        WHERE feeder_line = ? AND fault_type = ?
-         AND status IN ('WAIT_DISPATCH','ASSIGNED','ARRIVED','REPAIRING')
+         AND status IN (${ABSORBING_TICKET_STATUS_SQL})
        ORDER BY id DESC LIMIT 1`,
       [asset.feeder_line, fault_type]
     );

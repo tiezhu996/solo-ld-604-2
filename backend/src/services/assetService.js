@@ -2,7 +2,7 @@
 
 const { tx, get, all, run } = require('../db');
 const { ApiError } = require('../errors');
-const { AssetHealthStatus, LogTemplates, renderTemplate } = require('../constants');
+const { AssetHealthStatus, LogTemplates, renderTemplate, OPEN_TICKET_STATUS_SQL } = require('../constants');
 const audit = require('./auditService');
 
 function listAssets(feederLine) {
@@ -10,7 +10,7 @@ function listAssets(feederLine) {
   const params = feederLine ? [feederLine] : [];
   return all(
     `SELECT a.*, c.name AS owner_crew_name,
-       (SELECT COUNT(*) FROM repair_tickets t WHERE t.asset_id = a.id AND t.status != 'CLOSED') AS open_ticket_count,
+       (SELECT COUNT(*) FROM repair_tickets t WHERE t.asset_id = a.id AND t.status IN (${OPEN_TICKET_STATUS_SQL})) AS open_ticket_count,
        (SELECT COUNT(*) FROM fault_reports r WHERE r.asset_id = a.id) AS report_count
      FROM grid_assets a
      LEFT JOIN crews c ON c.id = a.owner_crew_id

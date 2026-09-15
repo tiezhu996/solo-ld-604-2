@@ -306,9 +306,15 @@ async function confirmDispatch() {
 async function confirmReassign(crewId) {
   acting.value = true;
   try {
-    await runAction(
+    const result = await runAction(
       () => api('POST', `/tickets/${current.value.id}/reassign`, crewId ? { crew_id: crewId } : {}),
-      crewId ? '改派成功，备件占用已同步释放' : '已撤回待派工，备件占用已同步释放',
+    );
+    ElMessage.success(
+      result?.idempotent
+        ? '相同请求已处理过，工单保持当前状态'
+        : crewId
+          ? '改派成功，备件占用已同步释放'
+          : '已撤回待派工，备件占用已同步释放',
     );
     reassignVisible.value = false;
     await load();

@@ -2,13 +2,13 @@
 
 const { tx, get, all, run } = require('../db');
 const { ApiError } = require('../errors');
-const { LogTemplates, renderTemplate, DutyStatus } = require('../constants');
+const { LogTemplates, renderTemplate, DutyStatus, ACTIVE_TICKET_STATUS_SQL } = require('../constants');
 const audit = require('./auditService');
 
 function decorate(crew) {
   const active = get(
     `SELECT id, ticket_no, status FROM repair_tickets
-     WHERE crew_id = ? AND status IN ('ASSIGNED','ARRIVED','REPAIRING') LIMIT 1`,
+     WHERE crew_id = ? AND status IN (${ACTIVE_TICKET_STATUS_SQL}) LIMIT 1`,
     [crew.id]
   );
   return {
@@ -30,7 +30,7 @@ function availability(faultType) {
   return all('SELECT * FROM crews ORDER BY id').map((crew) => {
     const skills = JSON.parse(crew.skill_tags);
     const active = get(
-      `SELECT ticket_no FROM repair_tickets WHERE crew_id = ? AND status IN ('ASSIGNED','ARRIVED','REPAIRING') LIMIT 1`,
+      `SELECT ticket_no FROM repair_tickets WHERE crew_id = ? AND status IN (${ACTIVE_TICKET_STATUS_SQL}) LIMIT 1`,
       [crew.id]
     );
     let reason = null;
@@ -58,7 +58,7 @@ function setDuty(actor, crewId, dutyStatus) {
     if (!crew) throw new ApiError('NOT_FOUND', '班组不存在');
     if (dutyStatus === 'OFF') {
       const active = get(
-        `SELECT ticket_no FROM repair_tickets WHERE crew_id = ? AND status IN ('ASSIGNED','ARRIVED','REPAIRING') LIMIT 1`,
+        `SELECT ticket_no FROM repair_tickets WHERE crew_id = ? AND status IN (${ACTIVE_TICKET_STATUS_SQL}) LIMIT 1`,
         [crew.id]
       );
       if (active) throw new ApiError('CREW_BUSY', `班组正在执行 ${active.ticket_no}，不能下班`);

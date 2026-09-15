@@ -75,6 +75,7 @@ async function main() {
     const dispatcher = await login('dispatcher01');
     const leader1 = await login('leader01'); // 抢修一班
     const leader2 = await login('leader02'); // 抢修二班
+    const leader3 = await login('leader03'); // 抢修三班
     const keeper = await login('keeper01');
     const auditor = await login('auditor01');
 
@@ -233,9 +234,15 @@ async function main() {
       check('改派前补充待审批申请', reqP.status === 201 && reqP.data.status === 'REQUESTED', reqP.data);
       const pendingUsageId = reqP.data.id;
 
-      // —— 失败回滚：改派给当前持有班组（在途占用）→ 409，库存/单据/事件零变化
+      // —— 幂等：请求的正是当前持有班组 → 返回当前成功状态，零副作用
+      const sameCrew = await api('POST', '/tickets/3/reassign', { token: dispatcher, body: { crew_id: 2 } });
+      check('请求当前持有班组返回当前成功状态（幂等）',
+        sameCrew.status === 200 && sameCrew.data.crew_id === 2 && sameCrew.data.idempotent === true, sameCrew.data);
+
+      // —— 失败回滚：改派给「其他」在途班组 → 409，库存/单据/事件零变化
+      await api('POST', `/tickets/${ticketD}/dispatch`, { token: dispatcher, body: { crew_id: 3 } }); // 三班先占用 ticketD
       const releasedBefore = (await api('GET', '/audit-logs?action=PART_RELEASED&pageSize=100', { token: auditor })).data.total;
-      const fail = await api('POST', '/tickets/3/reassign', { token: dispatcher, body: { crew_id: 2 } });
+      const fail = await api('POST', '/tickets/3/reassign', { token: dispatcher, body: { crew_id: 3 } });
       check('改派给在途班组失败（CREW_BUSY）', fail.status === 409 && fail.data.error.code === 'CREW_BUSY', fail.data);
       const partsAfterFail = await api('GET', '/parts', { token: keeper });
       check('改派失败库存未动（柱上开关仍为 1）', partsAfterFail.data.find((p) => p.id === 3).available_qty === 1);
@@ -246,6 +253,8 @@ async function main() {
         detailAfterFail.data.usages.find((u) => u.id === pendingUsageId).status === 'REQUESTED');
       const releasedAfterFail = (await api('GET', '/audit-logs?action=PART_RELEASED&pageSize=100', { token: auditor })).data.total;
       check('改派失败未写入释放事件', releasedAfterFail === releasedBefore, `${releasedBefore}→${releasedAfterFail}`);
+      // 恢复：ticketD 撤回待派工，三班释放（不影响后续补派测试）
+      await api('POST', `/tickets/${ticketD}/reassign`, { token: dispatcher, body: {} });
 
       // —— 成功改派：待审批释放 + 已审批回库 + 事件记录，同一事务完成
       const re = await api('POST', '/tickets/3/reassign', { token: dispatcher, body: { crew_id: 3 } });
@@ -283,6 +292,97 @@ async function main() {
       check('重复改派不重复记录释放事件', relLogs2.length === 2, relLogs2.length);
       const partsFinal = await api('GET', '/parts', { token: keeper });
       check('重复改派库存不重复回补（仍为 3）', partsFinal.data.find((p) => p.id === 3).available_qty === 3);
+    }
+
+    // ---------- 改派/撤回重试幂等与并发 ----------
+    console.log('\n[5b] 改派/撤回重试幂等、并发与状态定义统一');
+    {
+      const countReleased = async () =>
+        (await api('GET', '/audit-logs?action=PART_RELEASED&pageSize=100', { token: auditor })).data.rows
+          .filter((l) => l.detail.includes('WO-0003')).length;
+      const stockOf = async (id) =>
+        (await api('GET', '/parts', { token: keeper })).data.find((p) => p.id === id).available_qty;
+      const stockLogsOf = async (id) =>
+        (await api('GET', `/stock-logs?part_id=${id}`, { token: keeper })).data.length;
+
+      // 重新派工给二班，构造 已审批（柱上开关×1）+ 待审批（绝缘子串×1）各一笔
+      await api('POST', '/tickets/3/dispatch', { token: dispatcher, body: { crew_id: 2 } });
+      const rA = await api('POST', '/tickets/3/parts', { token: leader2, body: { part_id: 3, quantity: 1 } });
+      await api('POST', `/usages/${rA.data.id}/approve`, { token: keeper }); // 柱上开关 3→2
+      await api('POST', '/tickets/3/parts', { token: leader2, body: { part_id: 5, quantity: 1 } });
+
+      // —— 两个相同请求同时到达：只释放一次
+      const [c1, c2] = await Promise.all([
+        api('POST', '/tickets/3/reassign', { token: dispatcher, body: { crew_id: 3 } }),
+        api('POST', '/tickets/3/reassign', { token: dispatcher, body: { crew_id: 3 } }),
+      ]);
+      check('并发相同改派均返回成功', c1.status === 200 && c2.status === 200, `${c1.status},${c2.status}`);
+      check('并发改派后工单归属一致', c1.data.crew_id === 3 && c2.data.crew_id === 3);
+      check('并发请求只释放一次（事件累计 4 条）', await countReleased() === 4, await countReleased());
+      check('并发请求只回库一次（柱上开关 2→3）', await stockOf(3) === 3, await stockOf(3));
+
+      // —— 再次请求同一目标班组：返回当前成功状态，零副作用
+      const snap = { events: await countReleased(), stock: await stockOf(3), logs: await stockLogsOf(3) };
+      const retry = await api('POST', '/tickets/3/reassign', { token: dispatcher, body: { crew_id: 3 } });
+      check('同一目标重试返回当前成功状态',
+        retry.status === 200 && retry.data.crew_id === 3 && retry.data.status === 'ASSIGNED', retry.data);
+      check('同一目标重试标记幂等', retry.data.idempotent === true, retry.data);
+      check('重试不重复记录释放事件', await countReleased() === snap.events);
+      check('重试不重复回库', await stockOf(3) === snap.stock);
+      check('重试不重复写库存流水', await stockLogsOf(3) === snap.logs);
+
+      // —— 撤回后再次撤回：幂等返回，零副作用
+      const un1 = await api('POST', '/tickets/3/reassign', { token: dispatcher, body: {} });
+      check('撤回成功', un1.status === 200 && un1.data.status === 'WAIT_DISPATCH' && !un1.data.idempotent);
+      const un2 = await api('POST', '/tickets/3/reassign', { token: dispatcher, body: {} });
+      check('再次撤回返回当前成功状态',
+        un2.status === 200 && un2.data.status === 'WAIT_DISPATCH' && un2.data.idempotent === true, un2.data);
+      check('再次撤回零副作用',
+        await countReleased() === snap.events && await stockOf(3) === snap.stock && await stockLogsOf(3) === snap.logs);
+
+      // —— 换到不同目标且工单仍在途：正常改派，只释放一次
+      await api('POST', '/tickets/3/dispatch', { token: dispatcher, body: { crew_id: 2 } });
+      const rC = await api('POST', '/tickets/3/parts', { token: leader2, body: { part_id: 3, quantity: 1 } });
+      await api('POST', `/usages/${rC.data.id}/approve`, { token: keeper }); // 柱上开关 3→2
+      const diff = await api('POST', '/tickets/3/reassign', { token: dispatcher, body: { crew_id: 3 } });
+      check('在途工单改派到不同班组成功', diff.status === 200 && diff.data.crew_id === 3 && !diff.data.idempotent);
+      check('不同目标改派只回库一次（2→3）', await stockOf(3) === 3, await stockOf(3));
+      check('不同目标改派只新增一条释放事件', await countReleased() === snap.events + 1, await countReleased());
+
+      // —— 无效目标：工单、库存、领用、审计全部回到请求前状态
+      const badCrew = await api('POST', '/tickets/3/reassign', { token: dispatcher, body: { crew_id: 999 } });
+      check('不存在的班组返回 404', badCrew.status === 404 && badCrew.data.error.code === 'NOT_FOUND', badCrew.data);
+      const rD = await api('POST', '/tickets/3/parts', { token: leader3, body: { part_id: 1, quantity: 1 } });
+      await api('POST', `/usages/${rD.data.id}/approve`, { token: keeper }); // 避雷器 10→9
+      const preInvalid = { events: await countReleased(), stock1: await stockOf(1), stock3: await stockOf(3) };
+      const badDuty = await api('POST', '/tickets/3/reassign', { token: dispatcher, body: { crew_id: 4 } });
+      check('未值班班组改派被拒绝（CREW_OFF_DUTY）', badDuty.status === 409 && badDuty.data.error.code === 'CREW_OFF_DUTY');
+      const t3Invalid = await api('GET', '/tickets/3', { token: dispatcher });
+      check('无效目标后工单仍属原班组且在途',
+        t3Invalid.data.ticket.crew_id === 3 && t3Invalid.data.ticket.status === 'ASSIGNED', t3Invalid.data.ticket);
+      check('无效目标后领用保持已领用',
+        t3Invalid.data.usages.find((u) => u.id === rD.data.id).status === 'APPROVED');
+      check('无效目标后库存不变',
+        await stockOf(1) === preInvalid.stock1 && await stockOf(3) === preInvalid.stock3);
+      check('无效目标后无新释放事件', await countReleased() === preInvalid.events);
+
+      // 收尾：退回领用并撤回工单，恢复 WO-0003 待派工（供后续补派测试）
+      await api('POST', `/usages/${rD.data.id}/return`, { token: leader3 }); // 避雷器 9→10
+      const cleanup = await api('POST', '/tickets/3/reassign', { token: dispatcher, body: {} });
+      check('收尾恢复待派工', cleanup.status === 200 && cleanup.data.status === 'WAIT_DISPATCH');
+
+      // —— 源码守卫：状态判断统一引用共享常量，查询里不写状态集合字面量
+      const svcDir = path.join(__dirname, '..', 'src', 'services');
+      const literalHits = [];
+      for (const f of fs.readdirSync(svcDir)) {
+        const src = fs.readFileSync(path.join(svcDir, f), 'utf8');
+        const hits = src.match(/status\s+IN\s*\(\s*'[A-Z_]+'/g);
+        if (hits) literalHits.push(`${f}: ${hits.join(',')}`);
+      }
+      check('服务层查询不含状态集合字面量', literalHits.length === 0, literalHits.join(' | '));
+      const faultSrc = fs.readFileSync(path.join(svcDir, 'faultService.js'), 'utf8');
+      check('吸收报修引用共享状态定义 ABSORBING_TICKET_STATUS',
+        faultSrc.includes('ABSORBING_TICKET_STATUS_SQL'));
     }
 
     // ---------- 复电补派 ----------

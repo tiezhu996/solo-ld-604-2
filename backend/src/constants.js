@@ -24,6 +24,21 @@ const TicketStatusText = {
 const ACTIVE_TICKET_STATUS = ['ASSIGNED', 'ARRIVED', 'REPAIRING'];
 /** 允许吸收合并新报修的工单状态（已复电、已关闭不再吸收，新报修生成独立工单） */
 const ABSORBING_TICKET_STATUS = ['WAIT_DISPATCH', 'ASSIGNED', 'ARRIVED', 'REPAIRING'];
+/** 未闭环工单状态（除 CLOSED 外全部） */
+const OPEN_TICKET_STATUS = ['WAIT_DISPATCH', 'ASSIGNED', 'ARRIVED', 'REPAIRING', 'RESTORED'];
+/** 未闭环报修状态 */
+const OPEN_REPORT_STATUS = ['CONVERTED', 'MERGED'];
+/** 未完结备件领用状态（待审批 + 已领用未消耗，占用需释放） */
+const OPEN_USAGE_STATUS = ['REQUESTED', 'APPROVED'];
+
+/** 由状态常量拼接的 SQL IN 片段（常量非用户输入，可安全内联），
+ *  保证所有查询共用同一份状态定义，不在 SQL 里另写字面量 */
+const toSqlIn = (list) => list.map((s) => `'${s}'`).join(',');
+const ACTIVE_TICKET_STATUS_SQL = toSqlIn(ACTIVE_TICKET_STATUS);
+const ABSORBING_TICKET_STATUS_SQL = toSqlIn(ABSORBING_TICKET_STATUS);
+const OPEN_TICKET_STATUS_SQL = toSqlIn(OPEN_TICKET_STATUS);
+const OPEN_REPORT_STATUS_SQL = toSqlIn(OPEN_REPORT_STATUS);
+const OPEN_USAGE_STATUS_SQL = toSqlIn(OPEN_USAGE_STATUS);
 
 /** 故障等级（数值越大越严重，合并时取最高） */
 const Severity = ['MINOR', 'MAJOR', 'CRITICAL'];
@@ -104,6 +119,9 @@ function renderTemplate(template, vars) {
 module.exports = {
   FaultType, FaultTypeText,
   TicketStatus, TicketStatusText, ACTIVE_TICKET_STATUS, ABSORBING_TICKET_STATUS,
+  OPEN_TICKET_STATUS, OPEN_REPORT_STATUS, OPEN_USAGE_STATUS,
+  ACTIVE_TICKET_STATUS_SQL, ABSORBING_TICKET_STATUS_SQL,
+  OPEN_TICKET_STATUS_SQL, OPEN_REPORT_STATUS_SQL, OPEN_USAGE_STATUS_SQL,
   Severity, SeverityText, SeverityRank,
   AssetHealthStatus, AssetHealthStatusText,
   ReportStatus, ReportStatusText,
