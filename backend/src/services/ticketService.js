@@ -3,7 +3,7 @@
 const { tx, get, all, run, now } = require('../db');
 const { ApiError } = require('../errors');
 const {
-  ACTIVE_TICKET_STATUS, SeverityRank, SeverityText, TicketStatusText,
+  ACTIVE_TICKET_STATUS, SeverityRank, SeverityText, TicketStatusText, UsageStatusText,
   LogTemplates, renderTemplate,
 } = require('../constants');
 const audit = require('./auditService');
@@ -164,8 +164,10 @@ function advance(actor, ticketId, action) {
 }
 
 /**
- * 改派/撤回：释放原班组占用，并将该工单上已领用未消耗的备件同步释放回库存，
- * 然后改派到新班组或退回待派工队列。全部在单事务内完成。
+ * 改派/撤回：释放原班组占用，并将该工单上未完结的备件申请同步释放——
+ * 已审批的回库、待审批的作废，每条释放都写入含原申请人、数量、前后状态、
+ * 关联工单的可追溯事件。目标班组校验、释放、改派在同一事务内完成，
+ * 任一步失败整体回滚；已释放的申请不会被重复释放、重复记录。
  */
 function reassign(actor, ticketId, newCrewId) {
   return tx(() => {
@@ -173,37 +175,55 @@ function reassign(actor, ticketId, newCrewId) {
     if (!ACTIVE_TICKET_STATUS.includes(ticket.status)) {
       throw new ApiError('TICKET_BAD_STATE', '仅在途工单可以改派');
     }
+    // 先校验目标班组：校验失败时不产生任何写入（等效于整体回滚）
+    let targetCrew = null;
+    if (newCrewId) {
+      targetCrew = assertCrewAssignable(newCrewId, ticket.fault_type);
+    }
     const fromCrew = get('SELECT * FROM crews WHERE id = ?', [ticket.crew_id]);
 
-    // 同步释放备件占用：已领用未消耗/未退回的备件退回库存
+    // 逐条释放未完结的备件申请（已审批回库 / 待审批作废），各写一条可追溯事件。
+    // 仅命中 APPROVED/REQUESTED 状态：已释放的不会再次被拾取，重复改派幂等。
     const usages = all(
-      `SELECT pu.*, sp.part_name, sp.available_qty FROM part_usages pu
+      `SELECT pu.*, sp.part_name, ru.name AS requested_by_name
+       FROM part_usages pu
        JOIN spare_parts sp ON sp.id = pu.part_id
-       WHERE pu.ticket_id = ? AND pu.status = 'APPROVED'`,
+       LEFT JOIN users ru ON ru.id = pu.requested_by
+       WHERE pu.ticket_id = ? AND pu.status IN ('APPROVED','REQUESTED')
+       ORDER BY pu.id`,
       [ticket.id]
     );
     for (const u of usages) {
-      run('UPDATE spare_parts SET available_qty = available_qty + ? WHERE id = ?', [u.quantity, u.part_id]);
-      const balance = get('SELECT available_qty AS q FROM spare_parts WHERE id = ?', [u.part_id]).q;
-      run(`UPDATE part_usages SET status = 'RELEASED', resolved_at = ? WHERE id = ?`, [now(), u.id]);
-      run(`INSERT INTO stock_logs(part_id, change_qty, balance_after, reason, ref_type, ref_id, created_at)
-           VALUES (?,?,?,?,?,?,?)`,
-        [u.part_id, u.quantity, balance, `工单 ${ticket.ticket_no} 改派释放`, 'RELEASE', u.id, now()]);
+      const fromStatus = u.status;
+      if (fromStatus === 'APPROVED') {
+        // 已审批备件回库，写库存流水
+        run('UPDATE spare_parts SET available_qty = available_qty + ? WHERE id = ?', [u.quantity, u.part_id]);
+        const balance = get('SELECT available_qty AS q FROM spare_parts WHERE id = ?', [u.part_id]).q;
+        run(`INSERT INTO stock_logs(part_id, change_qty, balance_after, reason, ref_type, ref_id, created_at)
+             VALUES (?,?,?,?,?,?,?)`,
+          [u.part_id, u.quantity, balance, `工单 ${ticket.ticket_no} 改派/撤回释放回库`, 'RELEASE', u.id, now()]);
+      }
+      // 状态守卫更新：仅当仍处于原状态时才置为已释放
+      run(`UPDATE part_usages SET status = 'RELEASED', resolved_at = ? WHERE id = ? AND status = ?`,
+        [now(), u.id, fromStatus]);
       audit.write(actor, 'PART_RELEASED', 'PART_USAGE', u.id,
-        renderTemplate(LogTemplates.PART_RELEASED, { partName: u.part_name, quantity: u.quantity, available: balance }));
+        renderTemplate(LogTemplates.PART_RELEASED, {
+          ticketNo: ticket.ticket_no,
+          partName: u.part_name,
+          quantity: u.quantity,
+          fromStatus: UsageStatusText[fromStatus],
+          toStatus: UsageStatusText.RELEASED,
+          requestedBy: u.requested_by_name || '-',
+        }));
     }
-    // 待审批的申请单一并作废，避免悬空占用
-    run(`UPDATE part_usages SET status = 'RELEASED', resolved_at = ? WHERE ticket_id = ? AND status = 'REQUESTED'`,
-      [now(), ticket.id]);
 
-    if (newCrewId) {
-      const crew = assertCrewAssignable(newCrewId, ticket.fault_type);
+    if (targetCrew) {
       run(`UPDATE repair_tickets SET status = 'ASSIGNED', crew_id = ?, dispatcher_id = ?, dispatch_mode = 'MANUAL',
              assigned_at = ?, arrived_at = NULL, repair_started_at = NULL, restored_at = NULL WHERE id = ?`,
-        [crew.id, actor.id, now(), ticket.id]);
+        [targetCrew.id, actor.id, now(), ticket.id]);
       audit.write(actor, 'TICKET_REASSIGNED', 'TICKET', ticket.id,
         renderTemplate(LogTemplates.TICKET_REASSIGNED, {
-          ticketNo: ticket.ticket_no, fromCrew: fromCrew ? fromCrew.name : '-', toCrew: crew.name,
+          ticketNo: ticket.ticket_no, fromCrew: fromCrew ? fromCrew.name : '-', toCrew: targetCrew.name,
         }));
     } else {
       run(`UPDATE repair_tickets SET status = 'WAIT_DISPATCH', crew_id = NULL, dispatcher_id = ?, dispatch_mode = NULL,

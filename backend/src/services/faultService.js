@@ -26,10 +26,12 @@ function registerFault(actor, payload) {
     if (!asset) throw new ApiError('NOT_FOUND', '故障资产不存在');
     if (!FaultTypeText[fault_type]) throw new ApiError('VALIDATION_ERROR', '故障类型不合法');
 
-    // 同线路 + 同类型 + 未闭环 的工单即合并目标
+    // 同线路 + 同类型 + 仍可吸收（待派工/在途）的工单即合并目标；
+    // 已复电、已关闭工单不再吸收，新报修生成独立待派工单
     const openTicket = get(
       `SELECT * FROM repair_tickets
-       WHERE feeder_line = ? AND fault_type = ? AND status != 'CLOSED'
+       WHERE feeder_line = ? AND fault_type = ?
+         AND status IN ('WAIT_DISPATCH','ASSIGNED','ARRIVED','REPAIRING')
        ORDER BY id DESC LIMIT 1`,
       [asset.feeder_line, fault_type]
     );

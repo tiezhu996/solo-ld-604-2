@@ -22,6 +22,8 @@ const TicketStatusText = {
 };
 /** 班组在途任务占用状态（复电后即释放班组） */
 const ACTIVE_TICKET_STATUS = ['ASSIGNED', 'ARRIVED', 'REPAIRING'];
+/** 允许吸收合并新报修的工单状态（已复电、已关闭不再吸收，新报修生成独立工单） */
+const ABSORBING_TICKET_STATUS = ['WAIT_DISPATCH', 'ASSIGNED', 'ARRIVED', 'REPAIRING'];
 
 /** 故障等级（数值越大越严重，合并时取最高） */
 const Severity = ['MINOR', 'MAJOR', 'CRITICAL'];
@@ -89,7 +91,7 @@ const LogTemplates = {
   PART_REJECTED: '备件申请驳回：{partName} × {quantity}（{reason}）',
   PART_RETURNED: '备件 {partName} × {quantity} 退回入库（可用 {available}）',
   PART_CONSUMED: '备件 {partName} × {quantity} 核销消耗',
-  PART_RELEASED: '备件 {partName} × {quantity} 随工单改派/撤回释放（可用 {available}）',
+  PART_RELEASED: '工单 {ticketNo} 改派/撤回，释放备件 {partName} × {quantity}（{fromStatus} → {toStatus}，原申请人 {requestedBy}）',
   PART_RESTOCKED: '备件 {partName} 入库 {quantity} 件（可用 {available}）',
   CREW_DUTY_CHANGED: '班组 {crewName} 值班状态切换为 {dutyStatus}',
   ASSET_HEALTH_CHANGED: '资产 {assetCode} 健康状态调整为 {healthStatus}',
@@ -101,7 +103,7 @@ function renderTemplate(template, vars) {
 
 module.exports = {
   FaultType, FaultTypeText,
-  TicketStatus, TicketStatusText, ACTIVE_TICKET_STATUS,
+  TicketStatus, TicketStatusText, ACTIVE_TICKET_STATUS, ABSORBING_TICKET_STATUS,
   Severity, SeverityText, SeverityRank,
   AssetHealthStatus, AssetHealthStatusText,
   ReportStatus, ReportStatusText,

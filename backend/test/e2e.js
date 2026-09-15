@@ -107,6 +107,7 @@ async function main() {
     console.log('\n[2] 故障登记与合并');
     let ticketA;
     let ticketD;
+    let usage1Id;
     {
       // 新线路+类型 → 生成新工单
       const r = await api('POST', '/faults', {
@@ -202,7 +203,7 @@ async function main() {
 
       const req1 = await api('POST', '/tickets/3/parts', { token: leader2, body: { part_id: 3, quantity: 2 } });
       check('备件申请成功（待审批）', req1.status === 201 && req1.data.status === 'REQUESTED', req1.data);
-      const usage1 = req1.data.id;
+      usage1Id = req1.data.id;
 
       const req2 = await api('POST', '/tickets/3/parts', { token: leader2, body: { part_id: 5, quantity: 4 } });
       const usage2 = req2.data.id;
@@ -214,34 +215,74 @@ async function main() {
       const rej = await api('POST', `/usages/${usage2}/reject`, { token: keeper, body: { reason: '规格不符' } });
       check('仓管驳回申请', rej.status === 200 && rej.data.status === 'REJECTED');
 
-      const app = await api('POST', `/usages/${usage1}/approve`, { token: keeper, body: {} });
+      const app = await api('POST', `/usages/${usage1Id}/approve`, { token: keeper, body: {} });
       check('仓管审批出库', app.status === 200 && app.data.status === 'APPROVED');
       const after = await api('GET', '/parts', { token: keeper });
       check('审批后库存同步扣减（3→1）', after.data.find((p) => p.id === 3).available_qty === 1);
 
-      const dupApprove = await api('POST', `/usages/${usage1}/approve`, { token: keeper, body: {} });
+      const dupApprove = await api('POST', `/usages/${usage1Id}/approve`, { token: keeper, body: {} });
       check('重复审批被拒绝（409）', dupApprove.status === 409);
     }
 
     // ---------- 改派释放 ----------
-    console.log('\n[5] 改派同步释放库存与班组占用');
+    console.log('\n[5] 改派：同事务释放、失败回滚与幂等');
     {
+      // 在途工单 WO-0003（二班，REPAIRING）：已有已审批领用 usage1Id（柱上开关×2，库存 3→1），
+      // 再补一笔待审批申请（绝缘子串×2）
+      const reqP = await api('POST', '/tickets/3/parts', { token: leader2, body: { part_id: 5, quantity: 2 } });
+      check('改派前补充待审批申请', reqP.status === 201 && reqP.data.status === 'REQUESTED', reqP.data);
+      const pendingUsageId = reqP.data.id;
+
+      // —— 失败回滚：改派给当前持有班组（在途占用）→ 409，库存/单据/事件零变化
+      const releasedBefore = (await api('GET', '/audit-logs?action=PART_RELEASED&pageSize=100', { token: auditor })).data.total;
+      const fail = await api('POST', '/tickets/3/reassign', { token: dispatcher, body: { crew_id: 2 } });
+      check('改派给在途班组失败（CREW_BUSY）', fail.status === 409 && fail.data.error.code === 'CREW_BUSY', fail.data);
+      const partsAfterFail = await api('GET', '/parts', { token: keeper });
+      check('改派失败库存未动（柱上开关仍为 1）', partsAfterFail.data.find((p) => p.id === 3).available_qty === 1);
+      const detailAfterFail = await api('GET', '/tickets/3', { token: dispatcher });
+      check('改派失败已审批领用保持已领用',
+        detailAfterFail.data.usages.find((u) => u.id === usage1Id).status === 'APPROVED');
+      check('改派失败待审批申请保持待审批',
+        detailAfterFail.data.usages.find((u) => u.id === pendingUsageId).status === 'REQUESTED');
+      const releasedAfterFail = (await api('GET', '/audit-logs?action=PART_RELEASED&pageSize=100', { token: auditor })).data.total;
+      check('改派失败未写入释放事件', releasedAfterFail === releasedBefore, `${releasedBefore}→${releasedAfterFail}`);
+
+      // —— 成功改派：待审批释放 + 已审批回库 + 事件记录，同一事务完成
       const re = await api('POST', '/tickets/3/reassign', { token: dispatcher, body: { crew_id: 3 } });
       check('改派到三班成功', re.status === 200 && re.data.crew_id === 3 && re.data.status === 'ASSIGNED', re.data);
+      const partsNow = await api('GET', '/parts', { token: keeper });
+      check('已审批备件同步回库（1→3）', partsNow.data.find((p) => p.id === 3).available_qty === 3);
+      check('待审批释放不动库存（绝缘子串仍为 45）', partsNow.data.find((p) => p.id === 5).available_qty === 45);
+      const detail2 = await api('GET', '/tickets/3', { token: dispatcher });
+      check('已审批领用已释放', detail2.data.usages.find((u) => u.id === usage1Id).status === 'RELEASED');
+      check('待审批申请已释放', detail2.data.usages.find((u) => u.id === pendingUsageId).status === 'RELEASED');
 
-      const parts = await api('GET', '/parts', { token: keeper });
-      check('改派后已领备件库存回补（1→3）', parts.data.find((p) => p.id === 3).available_qty === 3);
+      // —— 每条释放都有可追溯事件：原申请人、备件数量、前后状态、关联工单
+      const relLogs = (await api('GET', '/audit-logs?action=PART_RELEASED&pageSize=100', { token: auditor })).data.rows
+        .filter((l) => l.detail.includes('WO-0003'));
+      check('释放事件逐条记录（2 条）', relLogs.length === 2, relLogs.map((l) => l.detail));
+      const evApproved = relLogs.find((l) => l.detail.includes('柱上开关'));
+      const evPending = relLogs.find((l) => l.detail.includes('绝缘子串'));
+      check('释放事件含前后状态/原申请人/数量/工单（已审批）',
+        !!evApproved && evApproved.detail.includes('已领用 → 已释放')
+          && evApproved.detail.includes('李建国') && evApproved.detail.includes('× 2')
+          && evApproved.detail.includes('WO-0003'),
+        evApproved && evApproved.detail);
+      check('释放事件含前后状态/数量/工单（待审批）',
+        !!evPending && evPending.detail.includes('待审批 → 已释放')
+          && evPending.detail.includes('× 2') && evPending.detail.includes('WO-0003'),
+        evPending && evPending.detail);
+      const stockLogs = await api('GET', '/stock-logs?part_id=3', { token: keeper });
+      check('回库流水关联工单号', stockLogs.data.some((l) => l.change_qty === 2 && l.reason.includes('WO-0003')));
 
-      const detail = await api('GET', '/tickets/3', { token: dispatcher });
-      const released = detail.data.usages.find((u) => u.status === 'RELEASED');
-      check('原领用单状态变为已释放', !!released, detail.data.usages);
-
-      const logs = await api('GET', '/stock-logs?part_id=3', { token: keeper });
-      check('库存流水记录释放入库', logs.data.some((l) => l.change_qty === 2 && /释放/.test(l.reason)), logs.data);
-
-      // 撤回到待派工
+      // —— 重复改派（撤回）不重复释放、不重复记录
       const back = await api('POST', '/tickets/3/reassign', { token: dispatcher, body: {} });
       check('撤回工单回待派工队列', back.status === 200 && back.data.status === 'WAIT_DISPATCH' && back.data.crew_id === null);
+      const relLogs2 = (await api('GET', '/audit-logs?action=PART_RELEASED&pageSize=100', { token: auditor })).data.rows
+        .filter((l) => l.detail.includes('WO-0003'));
+      check('重复改派不重复记录释放事件', relLogs2.length === 2, relLogs2.length);
+      const partsFinal = await api('GET', '/parts', { token: keeper });
+      check('重复改派库存不重复回补（仍为 3）', partsFinal.data.find((p) => p.id === 3).available_qty === 3);
     }
 
     // ---------- 复电补派 ----------
@@ -295,6 +336,24 @@ async function main() {
       const lateReq = await api('POST', `/tickets/${ticketA.id}/parts`, { token: leader1, body: { part_id: 1, quantity: 1 } });
       check('复电后不可再申请备件（409）', lateReq.status === 409 && lateReq.data.error.code === 'TICKET_BAD_STATE');
 
+      // —— 边界：已复电工单不再吸收同线路同类型新报修，新报修生成独立待派工单
+      const rWhileRestored = await api('POST', '/faults', {
+        token: dispatcher,
+        body: { reporter_name: '测试己', phone: '13000000006', asset_id: 6, fault_type: 'TRIP', severity: 'MAJOR', address_desc: '城南一线复电后再跳闸', report_channel: '热线' },
+      });
+      check('已复电工单不吸收新报修，生成独立待派工单',
+        rWhileRestored.data.merged === false
+          && rWhileRestored.data.ticket.id !== ticketA.id
+          && rWhileRestored.data.ticket.status === 'WAIT_DISPATCH',
+        rWhileRestored.data);
+      const ticketE = rWhileRestored.data.ticket.id;
+      const detailRestored = await api('GET', `/tickets/${ticketA.id}`, { token: dispatcher });
+      check('原工单报修归属不变（仍 3 条）', detailRestored.data.reports.length === 3, detailRestored.data.reports.length);
+      check('原工单处理历史不变（已复电且在途时间线完整）',
+        detailRestored.data.ticket.status === 'RESTORED'
+          && !!detailRestored.data.ticket.restored_at
+          && !!detailRestored.data.ticket.arrived_at);
+
       // 关闭被未完结领用阻塞
       const blocked = await api('POST', `/tickets/${ticketA.id}/advance`, { token: leader1, body: { action: 'close' } });
       check('存在未完结领用时禁止关闭', blocked.status === 409 && blocked.data.error.code === 'TICKET_BAD_STATE', blocked.data);
@@ -317,12 +376,14 @@ async function main() {
       const detail = await api('GET', `/tickets/${ticketA.id}`, { token: dispatcher });
       check('关闭后关联报修单全部闭环', detail.data.reports.every((r) => r.status === 'CLOSED'));
 
-      // 关闭后同线路同类型新报修应生成新工单而非合并进已关闭工单
+      // 已闭环工单同样不吸收；同线路同类型新报修合并进上一步生成的独立待派工单
       const rNew = await api('POST', '/faults', {
         token: dispatcher,
-        body: { reporter_name: '测试戊', phone: '13000000005', asset_id: 6, fault_type: 'TRIP', severity: 'MAJOR', address_desc: '城南一线再次跳闸', report_channel: '热线' },
+        body: { reporter_name: '测试戊', phone: '13000000005', asset_id: 6, fault_type: 'TRIP', severity: 'MINOR', address_desc: '城南一线再次跳闸', report_channel: '热线' },
       });
-      check('已闭环工单不再吸收合并', rNew.data.merged === false && rNew.data.ticket.id !== ticketA.id, rNew.data);
+      check('已闭环工单不吸收，新报修合并进独立待派工单',
+        rNew.data.merged === true && rNew.data.ticket.id === ticketE && rNew.data.ticket.id !== ticketA.id,
+        rNew.data);
     }
 
     // ---------- 审计与库存流水 ----------
